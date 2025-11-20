@@ -9,6 +9,8 @@ import { CacheProvider as InMemoryCacheProvider } from "./inmemory-cache-provide
 import * as algorithms from "./algorithms";
 import { signAuthnRequestPost } from "./saml-post-signing";
 import { ParsedQs } from "qs";
+import * as xmlCrypto from "xml-crypto";
+
 import {
   isValidSamlSigningOptions,
   AudienceRestrictionXML,
@@ -38,6 +40,8 @@ import {
   parseDomFromString,
   parseXml2JsFromString,
   validateXmlSignatureForCert,
+  normalizeXml,
+  normalizeNewlines,
   xpath,
 } from "./xml";
 
@@ -689,6 +693,163 @@ class SAML {
 
     return checkedCerts;
   }
+  /**
+   * Input: fullXml, the document for SignedXML context
+   * Input: currentNode, this node must have a Signature
+   * Input: certs: a list of certificates that are trusted
+   * Find's a signature for the currentNode
+   * Return the verified contents if verified
+   * Otherwise returns null
+   */
+  public getVerifiedXml = (
+    fullXml: string,
+    currentNode: Element,
+    certs: string[]
+  ): string | null => {
+    // find any signature
+    const signatures = xpath.selectElements(
+      currentNode,
+      "./*[local-name(.)='Signature' and namespace-uri(.)='http://www.w3.org/2000/09/xmldsig#']"
+    );
+    if (signatures.length < 1) {
+      return null;
+    }
+
+    if (signatures.length > 1) {
+      throw new Error("Too many signatures found for this element");
+    }
+
+    const signature = signatures[0];
+
+    const xpathTransformQuery =
+      ".//*[local-name(.)='Transform' and namespace-uri(.)='http://www.w3.org/2000/09/xmldsig#']";
+    const transforms = xpath.selectElements(signature, xpathTransformQuery);
+    // Reject also XMLDSIG with more than 2 Transform
+    if (transforms.length > 2) {
+      // do not return false, throw an error so that it can be caught by tests differently
+      throw new Error("Invalid signature, too many transforms");
+    }
+
+    for (const cert of certs) {
+      const sig = new xmlCrypto.SignedXml();
+      sig.keyInfoProvider = {
+        file: "",
+        getKeyInfo: () => "<X509Data></X509Data>",
+        getKey: () => Buffer.from(cert),
+      };
+      const signatureStr = normalizeNewlines(signature.toString());
+      sig.loadSignature(signatureStr);
+
+      // here are the sanity checks
+      const refs = sig.references;
+
+      if (refs.length !== 1) return null;
+      if (!signature.parentNode) {
+        return null;
+      }
+
+      const ref = refs[0];
+
+      // only allow enveloped signature
+      const refUri = ref.uri!;
+      if (!refUri) {
+        throw new Error("signature reference uri not found");
+      }
+
+      const refId = refUri[0] === "#" ? refUri.substring(1) : refUri;
+
+      if (!refId) {
+        throw new Error("signature reference uri not found");
+      }
+      // prevent XPath injection
+      if (refId.includes("'") || refId.includes('"')) {
+        throw new Error("ref URI included quote character ' or \". Not a valid ID, and not allowed");
+      }
+
+      const idAttribute = currentNode.getAttribute("ID") ? "ID" : "Id";
+      const totalReferencedNodes = xpath.selectElements(
+        signature.ownerDocument,
+        `//*[@${idAttribute}="${refId}"]`
+      );
+
+      if (totalReferencedNodes.length !== 1) {
+        throw new Error("Invalid signature: ID cannot refer to more than one element");
+      }
+
+      if (totalReferencedNodes[0] !== signature.parentNode) {
+        throw new Error("Invalid signature: Referenced node does not refer to it's parent element");
+      }
+
+      // actual cryptographic verification
+      // normalize XML to replace XML-encoded carriage returns with actual carriage returns
+      const normalizedXml = normalizeXml(fullXml);
+      const normalizedXmlWithNewlines = normalizeNewlines(normalizedXml);
+
+      try {
+        if (!sig.checkSignature(normalizedXmlWithNewlines)) {
+          continue; // no signatures verified
+        }
+
+        // For xml-crypto version 2.x, we need to extract the verified content differently
+        // The signed content is the canonical form of the referenced element
+        if (sig.references.length !== 1) {
+          throw new Error("Only 1 signed references should be present in signature");
+        }
+
+        // Get the referenced node and return its string representation
+        return totalReferencedNodes[0].toString();
+      } catch {
+        // continue to next cert
+      }
+    }
+
+    return null;
+  };
+
+  // given actually signed XML, try to get the actual assertion used
+  private async getSignedAssertion(signedXml: string): Promise<string | null> {
+    // case 1: Response signed
+    const verifiedDoc = parseDomFromString(signedXml);
+    const rootNode = verifiedDoc.documentElement;
+
+    // case 1: response is a verified assertion
+    if (rootNode.localName === "Response") {
+      // try getting the Xml from the assertions
+      const assertions = xpath.selectElements(rootNode, "./*[local-name()='Assertion']");
+      // now we can process the assertion as an assertion
+      if (assertions.length == 1) {
+        return assertions[0].toString();
+      }
+      // encrypted assertion
+      const encryptedAssertions = xpath.selectElements(
+        rootNode,
+        "./*[local-name()='EncryptedAssertion']"
+      );
+
+      if (encryptedAssertions.length === 1) {
+        const decryptionPvk = assertRequired(
+          this.options.decryptionPvk,
+          "No decryption key for encrypted SAML response"
+        );
+
+        const encryptedAssertionXml = encryptedAssertions[0].toString();
+
+        const decryptedXml = await decryptXml(encryptedAssertionXml, decryptionPvk);
+        const decryptedDoc = parseDomFromString(decryptedXml);
+        const decryptedAssertion = decryptedDoc.documentElement;
+        if (decryptedAssertion.localName !== "Assertion") {
+          throw new Error("Invalid EncryptedAssertion content");
+        }
+
+        return decryptedAssertion.toString();
+      }
+    } else if (rootNode.localName === "Assertion") {
+      return rootNode.toString();
+    } else {
+      return null;
+    }
+    return null;
+  }
 
   // This function checks that the |currentNode| in the |fullXml| document contains exactly 1 valid
   //   signature of the |currentNode|.
@@ -696,44 +857,9 @@ class SAML {
   // See https://github.com/bergie/passport-saml/issues/19 for references to some of the attack
   //   vectors against SAML signature verification.
   validateSignature(fullXml: string, currentNode: Element, certs: string[]): boolean {
-    const xpathSigQuery =
-      ".//*[" +
-      "local-name(.)='Signature' and " +
-      "namespace-uri(.)='http://www.w3.org/2000/09/xmldsig#' and " +
-      "descendant::*[local-name(.)='Reference' and @URI='#" +
-      currentNode.getAttribute("ID") +
-      "']" +
-      "]";
-    const signatures = xpath.selectElements(currentNode, xpathSigQuery);
-    // This function is expecting to validate exactly one signature, so if we find more or fewer
-    //   than that, reject.
-    if (signatures.length !== 1) {
-      return false;
-    }
-    const xpathTransformQuery =
-      ".//*[" +
-      "local-name(.)='Transform' and " +
-      "namespace-uri(.)='http://www.w3.org/2000/09/xmldsig#' and " +
-      "ancestor::*[local-name(.)='Reference' and @URI='#" +
-      currentNode.getAttribute("ID") +
-      "']" +
-      "]";
-    const transforms = xpath.selectElements(currentNode, xpathTransformQuery);
-    // Reject also XMLDSIG with more than 2 Transform
-    if (transforms.length > 2) {
-      // do not return false, throw an error so that it can be caught by tests differently
-      throw new Error("Invalid signature, too many transforms");
-    }
-
-    const signature = signatures[0];
-    return certs.some((certToCheck) => {
-      return validateXmlSignatureForCert(
-        signature,
-        this._certToPEM(certToCheck),
-        fullXml,
-        currentNode
-      );
-    });
+    const pemCerts = certs.map((cert) => this._certToPEM(cert));
+    const verifiedXml = this.getVerifiedXml(fullXml, currentNode, pemCerts);
+    return verifiedXml !== null;
   }
 
   async validatePostResponseAsync(
@@ -760,6 +886,13 @@ class SAML {
       const certs = await this.certsToCheck();
       // Check if this document has a valid top-level signature which applies to the entire XML document
       let validSignature = false;
+      // Use `getVerifiedXml()` to collect the actual verified contents
+      const pemCerts = certs.map((cert) => this._certToPEM(cert));
+
+      let responseVerifiedXml: string | null = null;
+      let assertionVerifiedXml: string | null = null;
+      let decryptedAssertionVerifiedXml: string | null = null;
+
       if (
         this.validateSignature(xml, doc.documentElement, certs) &&
         Array.from(doc.childNodes as NodeListOf<Element>).filter(
@@ -767,6 +900,7 @@ class SAML {
         ).length === 1
       ) {
         validSignature = true;
+        responseVerifiedXml = this.getVerifiedXml(xml, doc.documentElement, pemCerts);
       }
 
       const assertions = xpath.selectElements(
@@ -785,28 +919,23 @@ class SAML {
       }
 
       if (assertions.length == 1) {
-        if (
-          (this.options.wantAssertionsSigned || !validSignature) &&
-          !this.validateSignature(xml, assertions[0], certs)
-        ) {
-          throw new Error("Invalid signature");
+        if (this.options.wantAssertionsSigned || !validSignature) {
+          if (!this.validateSignature(xml, assertions[0], certs)) {
+            throw new Error("Invalid signature");
+          }
+          assertionVerifiedXml = this.getVerifiedXml(xml, assertions[0], pemCerts);
         }
-        return await this.processValidlySignedAssertionAsync(
-          assertions[0].toString(),
-          xml,
-          inResponseTo!
-        );
       }
 
       if (encryptedAssertions.length == 1) {
-        this.options.decryptionPvk = assertRequired(
+        const decryptionPvk = assertRequired(
           this.options.decryptionPvk,
           "No decryption key for encrypted SAML response"
         );
 
         const encryptedAssertionXml = encryptedAssertions[0].toString();
 
-        const decryptedXml = await decryptXml(encryptedAssertionXml, this.options.decryptionPvk);
+        const decryptedXml = await decryptXml(encryptedAssertionXml, decryptionPvk);
         const decryptedDoc = parseDomFromString(decryptedXml);
         const decryptedAssertions = xpath.selectElements(
           decryptedDoc,
@@ -814,18 +943,32 @@ class SAML {
         );
         if (decryptedAssertions.length != 1) throw new Error("Invalid EncryptedAssertion content");
 
-        if (
-          (this.options.wantAssertionsSigned || !validSignature) &&
-          !this.validateSignature(decryptedXml, decryptedAssertions[0], certs)
-        ) {
-          throw new Error("Invalid signature from encrypted assertion");
+        if (this.options.wantAssertionsSigned || !validSignature) {
+          if (!this.validateSignature(decryptedXml, decryptedAssertions[0], certs)) {
+            throw new Error("Invalid signature from encrypted assertion");
+          }
+          decryptedAssertionVerifiedXml = this.getVerifiedXml(
+            decryptedXml,
+            decryptedAssertions[0],
+            pemCerts
+          );
         }
+      }
 
-        return await this.processValidlySignedAssertionAsync(
-          decryptedAssertions[0].toString(),
-          xml,
-          inResponseTo!
-        );
+      // If there's no assertion, fall back on xml2js response parsing for the status &
+      //   LogoutResponse code.
+      // collect the verified XML's
+      const verifiedXml =
+        responseVerifiedXml || assertionVerifiedXml || decryptedAssertionVerifiedXml;
+
+      // double check that there is at least 1 assertion
+      if (verifiedXml && assertions.length + encryptedAssertions.length == 1) {
+        const signedAssertion = await this.getSignedAssertion(verifiedXml);
+
+        if (signedAssertion == null) {
+          throw new Error("Cannot obtain assertion from signed data");
+        }
+        return await this.processValidlySignedAssertionAsync(signedAssertion, xml, inResponseTo!);
       }
 
       // If there's no assertion, fall back on xml2js response parsing for the status &

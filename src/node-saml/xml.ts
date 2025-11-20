@@ -49,14 +49,14 @@ export const xpath = {
 export const decryptXml = async (xml: string, decryptionKey: string | Buffer) =>
   util.promisify(xmlenc.decrypt).bind(xmlenc)(xml, { key: decryptionKey });
 
-const normalizeNewlines = (xml: string): string => {
+export const normalizeNewlines = (xml: string): string => {
   // we can use this utility before passing XML to `xml-crypto`
   // we are considered the XML processor and are responsible for newline normalization
   // https://github.com/node-saml/passport-saml/issues/431#issuecomment-718132752
   return xml.replace(/\r\n?/g, "\n");
 };
 
-const normalizeXml = (xml: string): string => {
+export const normalizeXml = (xml: string): string => {
   // we can use this utility to parse and re-stringify XML
   // `DOMParser` will take care of normalization tasks, like replacing XML-encoded carriage returns with actual carriage returns
   return parseDomFromString(xml).toString();
