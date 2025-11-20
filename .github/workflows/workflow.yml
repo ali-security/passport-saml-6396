@@ -3,13 +3,13 @@ name: Build Status
 on:
   workflow_dispatch:
   push:
-    branches: [master]
+    branches: [master, 'main']
   pull_request:
     branches: [master]
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     strategy:
       matrix:
